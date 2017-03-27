@@ -1,0 +1,230 @@
+import numpy as np
+import matplotlib.pyplot as plt
+
+
+def getMemberLengthandAngle(nodes):
+    #the following calculation turns the list of nodes into indexes
+    node1Indexes = nodes[0] - 1
+    node2Indexes = nodes[1] - 1
+
+    #member length is pretty straight forward
+    memberLength = np.linalg.norm(nodeCoords[node2Indexes]-nodeCoords[node1Indexes])
+
+    #need arctan2 (4-quandrant arctangent)
+    memberAngle = np.arctan2(nodeCoords[node2Indexes][1] - nodeCoords[node1Indexes][1], nodeCoords[node2Indexes][0] - nodeCoords[node1Indexes][0] )
+    return memberLength, memberAngle
+
+
+def localMatrixAssembly(singleMemberInfo):
+    #unpacking for readability 
+    E,A,L,a = singleMemberInfo
+
+    #don't know if it's good practice to hard code this here, but I did
+    transformMatrix = np.array([ [(np.cos(a))**2, np.cos(a)*np.sin(a), -(np.cos(a))**2, -(np.cos(a)*np.sin(a))],
+                                 [np.cos(a)*np.sin(a), (np.sin(a))**2, -(np.cos(a)*np.sin(a)), -((np.sin(a))**2)],
+                                 [-((np.cos(a))**2), -(np.cos(a)*np.sin(a)), (np.cos(a))**2, np.cos(a)*np.sin(a)],
+                                 [-(np.cos(a)*np.sin(a)), -((np.sin(a))**2), np.cos(a)*np.sin(a), (np.sin(a))**2] ])
+    
+    return (E*A/L)*transformMatrix
+
+def bigAssembly(kTemplate,pages,memberGeometry):
+    for Ind,nodeInfo in enumerate(memberGeometry):
+        #create a vector of indexes for the kmatrix
+        kInds = [2*nodeInfo[0]-2, 2*nodeInfo[0]-1, 2*nodeInfo[1]-2, 2*nodeInfo[1]-1]
+        for rowInd,row in enumerate(pages[Ind]):
+            for colInd,val in enumerate(row):
+                kTemplate[kInds[rowInd]][kInds[colInd]] += val
+    return kTemplate
+
+def rearrange(boolArray,valArray,K):
+    #This function does alot (maybe too much for one function) in preparation for the main processing step
+
+    #list of indexes and two copies for use in rearranging array
+    indVec = np.array(list(range(len(boolArray))))
+    originalInds = indVec
+    indVecCopy = indVec
+
+    #copy of boundary condition values, presumably will use later
+    valCopy = valArray
+
+    #tell me the row locations where this condition is true
+    locations = np.where(boolArray[:,0] == False)
+
+    #store the values at the row locations where above condition is true
+    keepThese = valArray[locations]
+
+    #store the indexes of the row locations where above ^^ condition is true
+    keepTheseInds = indVec[locations]
+
+    #remove the values and stored indexes from BCs for concatenation later
+    valCopy = np.delete(valCopy,locations, axis=0)
+    indVecCopy = np.delete(indVecCopy,locations)
+
+    #concatenate new BC array and index array
+    BCs = np.concatenate((keepThese,valCopy))
+    indexes = np.concatenate((keepTheseInds,indVecCopy))
+
+    #drumroll... rearrange k matrix, then we're going to store K11 and K12
+    kMatrix[:,list(originalInds)] = K[:,list(indexes)]
+    kMatrix[list(originalInds),:] = K[list(indexes),:]
+
+    #K11*Uu + K12*Uk = Qk
+    K11 = kMatrix[0:len(keepThese),0:len(keepThese)]
+    K12 = kMatrix[0:len(keepThese),len(keepThese):]
+    restOfK = kMatrix[len(keepThese):,:]
+    Uk = BCs[len(keepThese):,0].reshape(-1,1)
+    Qk = BCs[0:len(keepThese),1].reshape(-1,1)
+
+    #indexes and restOfK are returned for secondary processing
+    return kMatrix,K11,K12,restOfK,Uk,Qk,indexes.reshape(-1,1)
+
+def mainProcess(K11,K12,Qk,Uk):
+
+    #this function is incredibly short compared to my other functions, but could take the longest in the event of a large structure
+    Uu = np.linalg.solve(K11,Qk - np.dot(K12,Uk))
+    return Uu.reshape(-1,1)
+
+def secondaryProcess(restOfK,Uu,Uk):
+    U = np.concatenate((Uu,Uk))
+    U = np.reshape(U,(-1,1))
+
+    #unknown q represents the unknown reaction forces
+    Qu = np.dot(restOfK,U)
+    return Qu.reshape(-1,1)
+
+def reOrder(newindexes,Uu,Uk,Qk,Qu):
+
+    #stack vertically, then pack side to side
+    U = np.concatenate((Uu,Uk))
+    Q = np.concatenate((Qk,Qu))
+    vecToSort = np.concatenate((newindexes,U,Q),axis=1)
+
+    #apparently not the "correct" way to sort this array based on the first column, but is apparently quick
+    vecToSort = vecToSort[vecToSort[:,0].argsort()]
+    return np.delete(vecToSort,[0],1) #removed first column which was only used for sorting
+
+def findStress(mainInfo,memberInfo,memberGeometry):
+    #template stress = (Ei/Li)*(-cos -sin cos sin)(DOFs (Us) )
+    #redoing a calculation performed in bigAssembly function, probably unwise
+    stresses = np.zeros((len(memberGeometry),2))
+    for memberInd, nodeNums in enumerate(memberGeometry):
+        E,A,L,a = memberInfo[memberInd]
+        dofInds = [2*nodeNums[0]-2, 2*nodeNums[0]-1, 2*nodeNums[1]-2, 2*nodeNums[1]-1]
+        DOFs = mainInfo[dofInds,0].reshape(-1,1)
+        stresses[memberInd,0] = (E/L)*np.dot([-np.cos(a), -np.sin(a), np.cos(a), np.sin(a)],DOFs)
+        stresses[memberInd,1] = A*stresses[memberInd,0]
+    return stresses
+    
+#All of the following information will be interpreted from user inputs (what the GUI will eventually do)
+#######################################################
+nodeCoords = 12*np.array([ [0, 0],
+                           [12, 15],
+                           [30, 0] ])
+
+#boolBC is an array telling us where the value is known (True) or unknown (False).
+boolBC = np.array([ [True, False],
+                    [True, False],
+                    [False, True],
+                    [False, True],
+                    [False, True],
+                    [True, False] ])
+
+#valBC is an array containing the values for the true elements in boolBC
+valBC = np.array([ [0, 0],
+                   [0, 0],
+                   [0, 0],
+                   [0, -20000],
+                   [0, 0],
+                   [0, 0] ])
+
+#memberGeometry is an array containing geometric information either typed or clicked by the user
+#member i: from node # | to node #
+memberGeometry = np.array([ [1, 2],
+                            [1, 3],
+                            [2, 3] ])
+
+#memberInfo is an array containing member information typed by the user
+#member i: modulus of Elasticity (E) | Cross-Sectional Area (A)
+
+memberInfo = np.array([ [30e6, 15],
+                        [30e6, 20],
+                        [30e6, 15] ])
+
+
+#######################################################
+
+#~~~~~~~~~~~~~~CALCULATIONS~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+#find the length and angle of each member
+LengthAngle = np.zeros((len(memberGeometry),2))
+for ind,val in enumerate(memberGeometry):
+    LengthAngle[ind][:] = getMemberLengthandAngle(val)
+
+#concatenate memberInfo and LengthAngle
+# member i: E | A | L | angle
+memberInfo = np.concatenate((memberInfo,LengthAngle), axis = 1)
+
+#create a 3-dimensional array with each transformed local matrix
+pages = np.zeros((len(memberInfo),4,4))
+
+#fill the pages with local stiffness matrices
+#print('Calculating Local Stiffness Matrices...')
+for ind,val in enumerate(memberInfo):
+    
+    #might need to round this in the future
+    pages[ind] = localMatrixAssembly(memberInfo[ind])
+    
+         
+#initiate global stiffness matrix of appropriate size
+kTemplate = np.zeros((2*len(nodeCoords),2*len(nodeCoords)))
+kMatrix = bigAssembly(kTemplate,pages,memberGeometry)
+kMatrix,K11,K12,restOfK,Uk,Qk,newindexes = rearrange(boolBC,valBC,kMatrix)
+
+#unknown displacements
+Uu = mainProcess(K11,K12,Qk,Uk)
+
+#unknown reaction forces
+Qu = secondaryProcess(restOfK,Uu,Uk)
+
+#package indexing vector,u vector, and q vector together for reordering
+#once they're in the correct order, we'll use the Us to compute stress (and force)
+#again, rounding may be necessary in future
+mainInfo = reOrder(newindexes,Uu,Uk,Qk,Qu)
+
+#to find the stresses and forces, we'll need mainInfo, E, L, angle
+Stresses = findStress(mainInfo,memberInfo,memberGeometry)
+
+
+Ulocations = np.where(boolBC[:,0] == False)
+Qlocations = np.where(boolBC[:,1] == False)
+
+
+print('Unknown Displacements:')
+for uloc in np.nditer(Ulocations):
+    print('U{} = {} m'.format(uloc+1,mainInfo[uloc,0]))
+
+print('\nUnknown Reaction Forces:')
+for qloc in np.nditer(Qlocations):
+    print('Q{} = {} N'.format(qloc+1,mainInfo[qloc,1]))
+
+print('\nStresses and Forces:')
+for memberNum, vals in enumerate(Stresses):
+    print('MEMBER {}: Stress = {} Pa    Force = {} N'.format(memberNum+1, vals[0], vals[1]))
+
+##########################plotting stuff##################################
+ampFactor = 1000
+Uvec = mainInfo[:,0]
+newCoords = np.zeros(nodeCoords.shape)
+for k in np.arange(len(newCoords)):
+    newCoords[k,:] = [ Uvec[2*k], Uvec[2*k+1] ]
+    
+newCoords += (ampFactor*newCoords + nodeCoords)
+
+plt.scatter(nodeCoords[:,0],nodeCoords[:,1],c='k')
+plt.scatter(newCoords[:,0],newCoords[:,1],c='r')
+for row in memberGeometry-1:
+    plt.plot([nodeCoords[row[0],0], nodeCoords[row[1],0]], [nodeCoords[row[0],1], nodeCoords[row[1],1]],'k--')
+    plt.plot([newCoords[row[0],0], newCoords[row[1],0]], [newCoords[row[0],1], newCoords[row[1],1]],'r-')
+
+
+plt.show()
